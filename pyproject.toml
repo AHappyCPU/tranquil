@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tranquil"
+version = "0.1.0"
+description = "Local-first eval and observability for coding agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Tranquil contributors" }
+]
+keywords = ["agents", "observability", "evals", "claude", "codex"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Environment :: Web Environment",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+  "rich>=13.7",
+]
+
+[project.scripts]
+tranquil = "tranquil.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tranquil"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/tranquil",
+  "tests",
+  "README.md",
+  "pyproject.toml",
+]
