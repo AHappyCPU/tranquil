@@ -16,7 +16,7 @@ from .init import claude_settings_path, codex_hooks_path, run_init
 from .mcp import run_mcp_server
 from .normalize import normalize_event
 from .otel import export_otlp_http
-from .server import serve
+from .server import run_terminal_app, serve
 from .signals import scan_idle_runs
 from .storage import Storage
 from .suites import import_fixture_file, import_suite_fixtures
@@ -29,7 +29,7 @@ from .util import json_dumps
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command_name is None:
-        args.command_name = "serve"
+        args.command_name = "app"
     try:
         return dispatch(args)
     except KeyboardInterrupt:
@@ -44,7 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--home", type=Path, default=None, help="Tranquil home directory (default: ~/.tranquil or TRANQUIL_HOME).")
     sub = parser.add_subparsers(dest="command_name")
 
-    serve_parser = sub.add_parser("serve", help="Start the collector and dashboard.")
+    app_parser = sub.add_parser("app", help="Start the collector and terminal Fleet view.")
+    app_parser.add_argument("--interval", type=float, default=2.0)
+
+    serve_parser = sub.add_parser("serve", help="Start the collector and web dashboard without the terminal UI.")
     serve_parser.add_argument("--host", default=None)
     serve_parser.add_argument("--port", type=int, default=None)
     serve_parser.add_argument("--db", type=Path, default=None)
@@ -157,6 +160,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def dispatch(args: argparse.Namespace) -> int:
+    if args.command_name == "app":
+        config = load_config(home=args.home, create=True)
+        return run_terminal_app(config, interval=args.interval)
     if args.command_name == "serve":
         config = load_config(home=args.home, create=True)
         if args.host:
@@ -174,8 +180,8 @@ def dispatch(args: argparse.Namespace) -> int:
             print(line)
         if should_launch_after_init(args):
             config = load_config(home=args.home, create=True)
-            print(f"launching dashboard: {config.url}")
-            serve(config)
+            print(f"launching Tranquil terminal app: {config.url}")
+            return run_terminal_app(config)
         return 0
     if args.command_name == "doctor":
         return cmd_doctor(args)

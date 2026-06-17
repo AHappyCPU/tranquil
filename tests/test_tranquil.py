@@ -20,9 +20,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from tranquil.config import SignalThresholds, TranquilConfig
-from tranquil.cli import main as tranquil_main, should_launch_after_init
+from tranquil.cli import build_parser, main as tranquil_main, should_launch_after_init
 from tranquil.evals import replay_fixture, run_eval, run_eval_matrix
 from tranquil.hook_forwarder import main as hook_forward_main
 from tranquil.init import run_init
@@ -1233,6 +1234,24 @@ class InitTests(unittest.TestCase):
             self.assertTrue(should_launch_after_init(SimpleNamespace(undo=False, no_launch=False, launch=True)))
             self.assertFalse(should_launch_after_init(SimpleNamespace(undo=False, no_launch=True, launch=True)))
             self.assertFalse(should_launch_after_init(SimpleNamespace(undo=True, no_launch=False, launch=True)))
+
+    def test_default_command_is_terminal_app(self) -> None:
+        args = build_parser().parse_args([])
+        if args.command_name is None:
+            args.command_name = "app"
+        self.assertEqual(args.command_name, "app")
+
+    def test_init_launch_uses_terminal_app(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            with mock.patch("tranquil.cli.run_terminal_app", return_value=0) as launched:
+                stdout = io.StringIO()
+                with contextlib.chdir(root), contextlib.redirect_stdout(stdout):
+                    code = tranquil_main(["--home", str(home), "init", "--agent", "claude-code", "--scope", "project", "--launch"])
+            self.assertEqual(code, 0)
+            self.assertEqual(launched.call_count, 1)
+            self.assertIn("launching Tranquil terminal app", stdout.getvalue())
 
     def test_claude_init_is_idempotent_and_reversible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

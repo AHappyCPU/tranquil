@@ -682,3 +682,27 @@ def serve(config: TranquilConfig) -> None:
         storage.close()
         if not stopping.is_set():
             stopping.set()
+
+
+def run_terminal_app(config: TranquilConfig, interval: float = 2.0) -> int:
+    from .tui import run_tui
+
+    notifier = SignalNotifier(config)
+    storage = Storage(
+        config.db_path,
+        thresholds=config.signal_thresholds,
+        raw_payloads=config.raw_payloads,
+        signal_sink=notifier.notify_signal,
+    )
+    httpd = TranquilHTTPServer(config, storage, notifier=notifier)
+    httpd.start_worker()
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.25}, name="tranquil-http", daemon=True)
+    thread.start()
+    try:
+        return run_tui(storage, config.signal_thresholds, interval=interval)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.stop_worker()
+        httpd.server_close()
+        storage.close()

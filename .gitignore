@@ -13,6 +13,7 @@ dist/
 *.sqlite3
 *.log
 .env
+.claude/
 .venv/
 venv/
 replays/

@@ -6,8 +6,9 @@ dashboard, detects unhealthy runs, and can promote captured runs into eval
 fixtures.
 
 This repository is dependency-light. `pip install .` gives you a working
-`tranquil` command without a separate service; the terminal UI uses Rich for
-polished local tables, panels, and live refresh.
+`tranquil` command without a separate service. The default command runs the
+local collector and a Rich terminal Fleet view in the same terminal; the web
+dashboard remains available from that same process.
 
 ## Quick start
 
@@ -17,9 +18,10 @@ tranquil init
 ```
 
 In an interactive terminal, `tranquil init` wires hooks and launches the local
-dashboard. Use `tranquil init --no-launch` when you only want to update config,
-or run `tranquil` later to start the dashboard. Open the printed URL. Hook
-events can be sent to:
+terminal app. Use `tranquil init --no-launch` when you only want to update
+config, or run `tranquil` later to start the collector plus terminal UI. Open
+the printed URL only when you want the secondary web dashboard. Hook events can
+be sent to:
 
 ```text
 POST http://127.0.0.1:8787/hooks/post-tool-use
@@ -69,10 +71,11 @@ only when you run the command.
 ## Commands
 
 ```text
-tranquil                       Start the local collector and dashboard
-tranquil serve                 Same as above
-tranquil init                  Wire local hooks and launch the dashboard
-tranquil init --no-launch      Wire local hooks without starting the dashboard
+tranquil                       Start the collector and Rich terminal Fleet view
+tranquil app                   Same as above
+tranquil serve                 Start collector and web dashboard only
+tranquil init                  Wire local hooks and launch the terminal app
+tranquil init --no-launch      Wire local hooks without starting Tranquil
 tranquil init --undo           Remove Tranquil-managed hook entries
 tranquil doctor                Check config, SQLite, collector health, and flow
 tranquil doctor --no-live      Skip the synthetic collector event check
