@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import base64
 import contextlib
-import os
 import json
 import io
 import shlex
 import shutil
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -15,8 +12,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,7 +25,7 @@ from tranquil.init import run_init
 from tranquil.mcp import run_mcp_server
 from tranquil.normalize import normalize_event
 from tranquil.otel import build_otlp_logs_payload
-from tranquil.server import TranquilHTTPServer, pre_tool_decision
+from tranquil.policy import pre_tool_decision
 from tranquil.storage import Storage
 from tranquil.suites import import_fixture_file, import_suite_fixtures, load_suite_file
 from tranquil.tailer import RolloutTailer, ingest_path
@@ -1265,6 +1260,10 @@ class InitTests(unittest.TestCase):
             data = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertTrue(data["_tranquil"]["managed"])
             self.assertEqual(len(data["hooks"]["PostToolUse"]), 1)
+            claude_hook = data["hooks"]["PostToolUse"][0]["hooks"][0]
+            self.assertEqual(claude_hook["type"], "command")
+            self.assertIn("hook_forwarder", claude_hook["command"])
+            self.assertNotIn("Bearer", claude_hook["command"])
             self.assertEqual(data["mcpServers"]["tranquil"]["command"], "tranquil")
             second = run_init(agent="claude-code", scope="project", home=home, cwd=project)
             self.assertIn(str(settings_path), second.unchanged)
@@ -1290,7 +1289,8 @@ class InitTests(unittest.TestCase):
             self.assertTrue(data["_tranquil"]["managed"])
             self.assertIn("PostToolUse", data["hooks"])
             command = data["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-            self.assertIn("hook-forward", command)
+            self.assertIn("hook_forwarder", command)
+            self.assertIn("--agent codex", command)
             self.assertNotIn("Bearer", command)
             second = run_init(agent="codex", scope="project", home=home, cwd=project)
             self.assertIn(str(hooks_path), second.unchanged)
@@ -1303,556 +1303,136 @@ class InitTests(unittest.TestCase):
             self.assertNotIn("hooks", data)
 
 
-class ServerTests(unittest.TestCase):
-    def test_http_hook_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="test-token",
-            )
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                port = server.server_address[1]
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/hooks/user-prompt-submit",
-                    data=json.dumps({"session_id": "http", "prompt": "hello"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json", "Authorization": "Bearer test-token"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(request, timeout=2) as response:
-                    self.assertEqual(response.status, 200)
-                server.event_queue.join()
-                deadline = time.time() + 2
-                run = None
-                while time.time() < deadline:
-                    runs = storage.list_runs()
-                    if runs:
-                        run = runs[0]
-                        break
-                    time.sleep(0.02)
-                self.assertIsNotNone(run)
-                assert run is not None
-                self.assertEqual(run["first_prompt"], "hello")
-            finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
-                storage.close()
+class HookTests(unittest.TestCase):
+    def run_hook(self, home, event, payload, agent="claude-code"):
+        argv = ["--home", str(home), "--event", event, "--agent", agent]
+        stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = hook_forward_main(argv, stdin=stdin, stdout=stdout, stderr=stderr)
+        return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_doctor_posts_synthetic_event_when_collector_is_running(self) -> None:
+    def test_command_hook_writes_claude_event_to_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            from tranquil.config import save_config
-
-            root = Path(tmp)
-            config = TranquilConfig(
-                home=root / "home",
-                db_path=root / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="doctor-token",
-            )
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            home = Path(tmp) / "home"
+            code, _out, _err = self.run_hook(home, "UserPromptSubmit", {"session_id": "hook", "prompt": "hello"})
+            self.assertEqual(code, 0)
+            storage = Storage(home / "tranquil.db")
             try:
-                config.port = server.server_address[1]
-                save_config(config)
-                stdout = io.StringIO()
-                with contextlib.redirect_stdout(stdout):
-                    code = tranquil_main(["--home", str(config.home), "doctor"])
-                self.assertEqual(code, 0)
-                self.assertIn("synthetic event: ok", stdout.getvalue())
                 runs = storage.list_runs()
                 self.assertEqual(len(runs), 1)
-                self.assertEqual(runs[0]["first_prompt"], "tranquil doctor synthetic event")
+                self.assertEqual(runs[0]["agent"], "claude-code")
+                self.assertEqual(runs[0]["first_prompt"], "hello")
             finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
                 storage.close()
 
-    def test_server_trace_sampling_captures_completed_hook_run(self) -> None:
+    def test_command_hook_writes_codex_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="sample-token",
+            home = Path(tmp) / "home"
+            code, _out, _err = self.run_hook(
+                home,
+                "PostToolUse",
+                {"session_id": "codex-hook", "tool_name": "Bash", "tool_input": {"command": "pytest"}},
+                agent="codex",
             )
-            config.trace_sampling_enabled = True
-            config.trace_sample_rate = 1.0
-            config.trace_sample_suite = "sampled"
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            self.assertEqual(code, 0)
+            storage = Storage(home / "tranquil.db")
             try:
-                port = server.server_address[1]
-                for slug, payload in (
-                    ("user-prompt-submit", {"session_id": "server-sample", "prompt": "sample this run"}),
-                    ("session-end", {"session_id": "server-sample"}),
-                ):
-                    request = urllib.request.Request(
-                        f"http://127.0.0.1:{port}/hooks/{slug}",
-                        data=json.dumps(payload).encode("utf-8"),
-                        headers={"Content-Type": "application/json", "Authorization": "Bearer sample-token"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(request, timeout=2) as response:
-                        self.assertEqual(response.status, 200)
-                server.event_queue.join()
-                fixtures = storage.list_fixtures(suite="sampled")
-                self.assertEqual(len(fixtures), 1)
-                self.assertEqual(fixtures[0]["prompt"], "sample this run")
-            finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
-                storage.close()
-
-    def test_pre_tool_policy_denies_forbidden_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="policy-token",
-            )
-            config.policy_enabled = True
-            config.policy_forbidden_paths = [".env", "secrets/**"]
-            storage = Storage(config.db_path)
-            seed = normalize_event("user-prompt-submit", {"session_id": "policy", "prompt": "edit config"})
-            storage.record_event(seed)
-            server = TranquilHTTPServer(config, storage)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                port = server.server_address[1]
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/hooks/pre-tool-use",
-                    data=json.dumps({"session_id": "policy", "tool_name": "Write", "tool_input": {"file_path": ".env"}}).encode(
-                        "utf-8"
-                    ),
-                    headers={"Content-Type": "application/json", "Authorization": "Bearer policy-token"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(request, timeout=2) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                    self.assertEqual(response.status, 200)
-                self.assertEqual(payload["permissionDecision"], "deny")
-                self.assertIn(".env", payload["permissionDecisionReason"])
-                signals = storage.list_run_signals(seed["run_id"])
-                self.assertEqual([signal["type"] for signal in signals], ["policy_denied"])
-                events = storage.get_run_events(seed["run_id"])
-                self.assertEqual(events[-1]["permission"]["decision"], "deny")
-            finally:
-                server.shutdown()
-                server.server_close()
-                storage.close()
-
-    def test_hook_forwarder_posts_codex_event(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="forward-token",
-            )
-            from tranquil.config import save_config
-
-            save_config(config)
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                port = server.server_address[1]
-                stdin = io.StringIO(json.dumps({"session_id": "codex-hook", "tool_name": "Bash", "tool_input": {"command": "pytest"}}))
-                stdout = io.StringIO()
-                stderr = io.StringIO()
-                code = hook_forward_main(
-                    [
-                        "--home",
-                        str(config.home),
-                        "--event",
-                        "PostToolUse",
-                        "--url",
-                        f"http://127.0.0.1:{port}/hooks/post-tool-use",
-                    ],
-                    stdin=stdin,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-                self.assertEqual(code, 0)
-                server.event_queue.join()
                 runs = storage.list_runs()
                 self.assertEqual(len(runs), 1)
                 self.assertEqual(runs[0]["agent"], "codex")
                 self.assertTrue(runs[0]["checks_ran"])
             finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
                 storage.close()
 
-    def test_websocket_receives_event_broadcast(self) -> None:
+    def test_command_hook_is_fail_open_on_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="ws-token",
-            )
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            sock: socket.socket | None = None
+            home = Path(tmp) / "home"
+            code, _out, _err = self.run_hook(home, "PostToolUse", "this is not json")
+            self.assertEqual(code, 0)
+            storage = Storage(home / "tranquil.db")
             try:
-                port = server.server_address[1]
-                sock = websocket_connect("127.0.0.1", port, "/ws")
-                hello = read_ws_json(sock)
-                self.assertEqual(hello["type"], "hello")
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/events",
-                    data=json.dumps({"event_hint": "user-prompt-submit", "session_id": "ws", "prompt": "live"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(request, timeout=2) as response:
-                    self.assertEqual(response.status, 200)
-                message = read_ws_json(sock)
-                self.assertEqual(message["type"], "event")
-                self.assertEqual(message["event_type"], "user_prompt")
-                self.assertTrue(message["run_id"].startswith("run_"))
+                self.assertEqual(len(storage.list_runs()), 1)
             finally:
-                if sock:
-                    sock.close()
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
                 storage.close()
 
-    def test_dashboard_eval_and_run_diff_apis(self) -> None:
+    def test_pre_tool_command_hook_denies_forbidden_path(self) -> None:
+        from tranquil.config import save_config
+
         with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="api-token",
-            )
+            home = Path(tmp) / "home"
+            config = TranquilConfig(home=home, db_path=home / "tranquil.db")
+            config.policy_enabled = True
+            config.policy_forbidden_paths = [".env", "secrets/**"]
+            save_config(config)
             storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
             try:
-                prompt_a = normalize_event("user-prompt-submit", {"session_id": "api-a", "repo": "repo", "branch": "main", "prompt": "first"})
-                test_a = normalize_event(
+                seed = normalize_event("user-prompt-submit", {"session_id": "policy", "prompt": "edit config"})
+                storage.record_event(seed)
+            finally:
+                storage.close()
+            code, out, _err = self.run_hook(
+                home,
+                "PreToolUse",
+                {"session_id": "policy", "tool_name": "Write", "tool_input": {"file_path": ".env"}},
+            )
+            self.assertEqual(code, 0)
+            decision = json.loads(out)
+            self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn(".env", decision["reason"])
+            storage = Storage(config.db_path)
+            try:
+                signals = storage.list_run_signals(seed["run_id"])
+                self.assertEqual([signal["type"] for signal in signals], ["policy_denied"])
+                events = storage.get_run_events(seed["run_id"])
+                self.assertEqual(events[-1]["permission"]["decision"], "deny")
+            finally:
+                storage.close()
+
+    def test_command_hook_samples_completed_trace(self) -> None:
+        from tranquil.config import save_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            config = TranquilConfig(home=home, db_path=home / "tranquil.db")
+            config.trace_sampling_enabled = True
+            config.trace_sample_rate = 1.0
+            config.trace_sample_suite = "sampled"
+            save_config(config)
+            self.run_hook(home, "UserPromptSubmit", {"session_id": "sample", "prompt": "sample this run"})
+            self.run_hook(home, "SessionEnd", {"session_id": "sample"})
+            storage = Storage(config.db_path)
+            try:
+                fixtures = storage.list_fixtures(suite="sampled")
+                self.assertEqual(len(fixtures), 1)
+                self.assertEqual(fixtures[0]["prompt"], "sample this run")
+            finally:
+                storage.close()
+
+    def test_storage_diff_runs_reports_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "tranquil.db")
+            try:
+                a = normalize_event(
                     "post-tool-use",
-                    {
-                        "session_id": "api-a",
-                        "repo": "repo",
-                        "branch": "main",
-                        "tool_name": "Bash",
-                        "tool_input": {"command": "pytest -q"},
-                        "exit_code": 0,
-                        "usage": {"cost_usd": 0.1},
-                    },
+                    {"session_id": "diff-a", "tool_name": "Bash", "tool_input": {"command": "ls"}, "usage": {"cost_usd": 0.1}},
                 )
-                end_a = normalize_event("session-end", {"session_id": "api-a", "repo": "repo", "branch": "main"})
-                prompt_b = normalize_event(
-                    "user-prompt-submit",
-                    {
-                        "session_id": "api-b",
-                        "repo": "repo",
-                        "branch": "feature",
-                        "prompt": "second",
-                        "labels": {"task": "redesign"},
-                    },
-                )
-                test_b = normalize_event(
+                b1 = normalize_event(
                     "post-tool-use",
-                    {
-                        "session_id": "api-b",
-                        "repo": "repo",
-                        "branch": "feature",
-                        "tool_name": "Bash",
-                        "tool_input": {"command": "pytest -q"},
-                        "exit_code": 0,
-                        "usage": {"cost_usd": 0.3},
-                    },
+                    {"session_id": "diff-b", "tool_name": "Bash", "tool_input": {"command": "ls"}, "usage": {"cost_usd": 0.3}},
                 )
-                write_b = normalize_event(
+                b2 = normalize_event(
                     "post-tool-use",
-                    {
-                        "session_id": "api-b",
-                        "repo": "repo",
-                        "branch": "feature",
-                        "tool_name": "Write",
-                        "tool_input": {"file_path": "app.py", "content": "print('ok')"},
-                    },
+                    {"session_id": "diff-b", "tool_name": "Write", "tool_input": {"file_path": "x.py", "content": "x"}},
                 )
-                child_b = normalize_event(
-                    "post-tool-use",
-                    {
-                        "session_id": "api-b-child",
-                        "parent_session_id": "api-b",
-                        "depth": 1,
-                        "repo": "repo",
-                        "branch": "feature",
-                        "model": "claude-sonnet",
-                        "tool_name": "Read",
-                        "tool_input": {"file_path": "app.py"},
-                        "usage": {"cost_usd": 0.05},
-                    },
-                )
-                end_b = normalize_event("session-end", {"session_id": "api-b", "repo": "repo", "branch": "feature"})
-                for event in (prompt_a, test_a, end_a, prompt_b, test_b, write_b, child_b, end_b):
+                for event in (a, b1, b2):
                     storage.record_event(event)
-                storage.create_fixture(prompt_a["run_id"], suite="api")
-                eval_run_id, _scores = run_eval(storage, suite="api", scorers=["tests_pass"])
-
-                port = server.server_address[1]
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/evals", timeout=2) as response:
-                    evals = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(evals["eval_runs"][0]["eval_run_id"], eval_run_id)
-                self.assertEqual(evals["eval_runs"][0]["passed_count"], 1)
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/evals/{eval_run_id}", timeout=2) as response:
-                    eval_detail = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(eval_detail["eval_run"]["score_count"], 1)
-                self.assertEqual(eval_detail["scores"][0]["scorer"], "tests_pass")
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs?limit=10", timeout=2) as response:
-                    runs = json.loads(response.read().decode("utf-8"))
-                by_run = {run["run_id"]: run for run in runs["runs"]}
-                self.assertEqual(by_run[prompt_b["run_id"]]["subagents_count"], 1)
-                self.assertEqual(by_run[prompt_b["run_id"]]["max_depth"], 1)
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs?repo=repo&branch=feature", timeout=2) as response:
-                    filtered = json.loads(response.read().decode("utf-8"))
-                self.assertEqual([run["run_id"] for run in filtered["runs"]], [prompt_b["run_id"]])
-                self.assertEqual(filtered["runs"][0]["labels"]["task"], ["redesign"])
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs?label=task%3Dredesign", timeout=2) as response:
-                    label_filtered = json.loads(response.read().decode("utf-8"))
-                self.assertEqual([run["run_id"] for run in label_filtered["runs"]], [prompt_b["run_id"]])
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs?agent=codex", timeout=2) as response:
-                    no_codex = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(no_codex["runs"], [])
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs/{prompt_b['run_id']}", timeout=2) as response:
-                    run_detail = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(run_detail["run"]["subagents_count"], 1)
-                self.assertEqual(run_detail["subagents"][0]["session_id"], "api-b-child")
-                self.assertEqual(run_detail["subagents"][0]["model"], "claude-sonnet")
-                files = {item["path"]: item for item in run_detail["files"]}
-                self.assertEqual(files["app.py"]["reads"], 1)
-                self.assertEqual(files["app.py"]["writes"], 1)
-                diff_events = [event for event in run_detail["events"] if event.get("diff")]
-                self.assertEqual(diff_events[0]["diff"]["kind"], "write")
-                self.assertIn("+print('ok')", diff_events[0]["diff"]["text"])
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/runs/{prompt_a['run_id']}", timeout=2) as response:
-                    scored_run_detail = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(scored_run_detail["scores"][0]["eval_run_id"], eval_run_id)
-                self.assertEqual(scored_run_detail["scores"][0]["scorer"], "tests_pass")
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/api/runs/{prompt_a['run_id']}/diff/{prompt_b['run_id']}",
-                    timeout=2,
-                ) as response:
-                    diff = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(diff["diff"]["delta"]["tool_calls"], 2)
-                self.assertGreater(diff["diff"]["delta"]["cost_usd_est"], 0)
+                diff = storage.diff_runs(a["run_id"], b1["run_id"])
+                self.assertEqual(diff["delta"]["tool_calls"], 1)
+                self.assertGreater(diff["delta"]["cost_usd_est"], 0)
+                self.assertEqual(diff["delta"]["files_touched"], 1)
             finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
                 storage.close()
-
-    def test_run_replay_api_requires_command_and_records_scores(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = TranquilConfig(
-                home=Path(tmp),
-                db_path=Path(tmp) / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="replay-token",
-            )
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                prompt = normalize_event("user-prompt-submit", {"session_id": "api-replay", "prompt": "replay me"})
-                storage.record_event(prompt)
-                port = server.server_address[1]
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/runs/{prompt['run_id']}/replay",
-                    data=b"{}",
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(request, timeout=2)
-                self.assertEqual(raised.exception.code, 400)
-                self.assertEqual(storage.list_fixtures(suite="replay"), [])
-
-                server.config.replay_command = 'test -f "$TRANQUIL_PROMPT_FILE"'
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/runs/{prompt['run_id']}/replay",
-                    data=b"{}",
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(request, timeout=5) as response:
-                    self.assertEqual(response.status, 201)
-                    payload = json.loads(response.read().decode("utf-8"))
-                self.assertTrue(payload["fixture"]["fixture_id"].startswith("fix_"))
-                self.assertTrue(payload["eval_run_id"].startswith("eval_"))
-                by_scorer = {score["scorer"]: score for score in payload["scores"]}
-                self.assertTrue(by_scorer["repo_materialized"]["passed"])
-                self.assertTrue(by_scorer["replay_command_exits_zero"]["passed"])
-            finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
-                storage.close()
-
-    def test_run_open_api_requires_editor_and_opens_touched_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            project = root / "project"
-            project.mkdir()
-            (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
-            marker = root / "opened.txt"
-            config = TranquilConfig(
-                home=root / "home",
-                db_path=root / "tranquil.db",
-                host="127.0.0.1",
-                port=0,
-                token="open-token",
-            )
-            storage = Storage(config.db_path)
-            server = TranquilHTTPServer(config, storage)
-            server.start_worker()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                event = normalize_event(
-                    "post-tool-use",
-                    {
-                        "session_id": "api-open",
-                        "cwd": str(project),
-                        "tool_name": "Write",
-                        "tool_input": {"file_path": "app.py", "content": "print('ok')"},
-                    },
-                )
-                storage.record_event(event)
-                port = server.server_address[1]
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/runs/{event['run_id']}/open",
-                    data=json.dumps({"path": "app.py"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(request, timeout=2)
-                self.assertEqual(raised.exception.code, 400)
-
-                server.config.editor_command = (
-                    f"{sys.executable} -c \"import pathlib,sys; pathlib.Path(sys.argv[2]).write_text(sys.argv[1])\" "
-                    f"{{path}} {marker}"
-                )
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/runs/{event['run_id']}/open",
-                    data=json.dumps({"path": "README.md"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(request, timeout=2)
-                self.assertEqual(raised.exception.code, 400)
-
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/runs/{event['run_id']}/open",
-                    data=json.dumps({"path": "app.py"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(request, timeout=2) as response:
-                    self.assertEqual(response.status, 200)
-                    payload = json.loads(response.read().decode("utf-8"))
-                self.assertTrue(payload["opened"])
-                deadline = time.time() + 2
-                while time.time() < deadline and not marker.exists():
-                    time.sleep(0.02)
-                self.assertEqual(marker.read_text(encoding="utf-8"), str((project / "app.py").resolve()))
-            finally:
-                server.shutdown()
-                server.stop_worker()
-                server.server_close()
-                storage.close()
-
-
-def websocket_connect(host: str, port: int, path: str) -> socket.socket:
-    sock = socket.create_connection((host, port), timeout=2)
-    key = base64.b64encode(os.urandom(16)).decode("ascii")
-    request = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n"
-    )
-    sock.sendall(request.encode("ascii"))
-    response = sock.recv(4096)
-    if b"101 Switching Protocols" not in response:
-        raise AssertionError(response.decode("latin1", errors="replace"))
-    return sock
-
-
-def read_ws_json(sock: socket.socket) -> dict[str, object]:
-    sock.settimeout(2)
-    header = recv_exact(sock, 2)
-    first, second = header
-    opcode = first & 0x0F
-    if opcode == 0x8:
-        raise AssertionError("websocket closed")
-    length = second & 0x7F
-    if length == 126:
-        length = int.from_bytes(recv_exact(sock, 2), "big")
-    elif length == 127:
-        length = int.from_bytes(recv_exact(sock, 8), "big")
-    payload = recv_exact(sock, length)
-    parsed = json.loads(payload.decode("utf-8"))
-    assert isinstance(parsed, dict)
-    return parsed
-
-
-def recv_exact(sock: socket.socket, length: int) -> bytes:
-    chunks = bytearray()
-    while len(chunks) < length:
-        chunk = sock.recv(length - len(chunks))
-        if not chunk:
-            raise AssertionError("socket closed")
-        chunks.extend(chunk)
-    return bytes(chunks)
 
 
 if __name__ == "__main__":

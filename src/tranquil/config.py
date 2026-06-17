@@ -39,7 +39,6 @@ class TranquilConfig:
     kill_switch_enabled: bool = False
     run_cost_budget_usd: float = 10.0
     replay_command: str | None = None
-    editor_command: str | None = None
     judge_command: str | None = None
     notification_webhook_url: str | None = None
     notification_command: str | None = None
@@ -81,7 +80,6 @@ def default_config(home: Path | None = None) -> TranquilConfig:
         token=token,
         transcript_paths=transcript_paths,
         codex_rollout_paths=codex_paths,
-        editor_command=os.environ.get("TRANQUIL_EDITOR_COMMAND") or None,
         judge_command=os.environ.get("TRANQUIL_JUDGE_COMMAND") or None,
         notification_webhook_url=os.environ.get("TRANQUIL_NOTIFICATION_WEBHOOK_URL") or None,
         notification_command=os.environ.get("TRANQUIL_NOTIFICATION_COMMAND") or None,
@@ -109,7 +107,6 @@ def load_config(home: Path | None = None, create: bool = True) -> TranquilConfig
         cfg.kill_switch_enabled = bool(data.get("kill_switch_enabled", cfg.kill_switch_enabled))
         cfg.run_cost_budget_usd = float(data.get("run_cost_budget_usd", cfg.run_cost_budget_usd))
         cfg.replay_command = data.get("replay_command") or None
-        cfg.editor_command = os.environ.get("TRANQUIL_EDITOR_COMMAND") or data.get("editor_command") or None
         cfg.judge_command = os.environ.get("TRANQUIL_JUDGE_COMMAND") or data.get("judge_command") or None
         cfg.notification_webhook_url = (
             os.environ.get("TRANQUIL_NOTIFICATION_WEBHOOK_URL") or data.get("notification_webhook_url") or None
@@ -171,8 +168,6 @@ def save_config(config: TranquilConfig) -> None:
     }
     if config.replay_command:
         payload["replay_command"] = config.replay_command
-    if config.editor_command:
-        payload["editor_command"] = config.editor_command
     if config.judge_command:
         payload["judge_command"] = config.judge_command
     if config.notification_webhook_url:

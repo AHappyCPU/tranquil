@@ -26,6 +26,17 @@ class SignalNotifier:
         thread = threading.Thread(target=self._deliver, args=(payload,), name="tranquil-signal-notifier", daemon=True)
         thread.start()
 
+    def deliver_sync(self, signal: dict[str, Any]) -> None:
+        """Deliver a signal on the calling thread.
+
+        Use this from short-lived processes (e.g. the command-hook ingester)
+        where a daemon thread would be killed before the webhook/command runs.
+        Each transport already bounds itself with a timeout and records errors.
+        """
+        if not self.enabled:
+            return
+        self._deliver({"type": "signal", "signal": signal})
+
     def _deliver(self, payload: dict[str, Any]) -> None:
         body = json_dumps(payload)
         if self.config.notification_webhook_url:

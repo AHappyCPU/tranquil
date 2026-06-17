@@ -77,7 +77,8 @@ def run_init(
         report.changed.append(str(config.config_path))
     else:
         report.unchanged.append(str(config.config_path))
-    report.notes.append(f"collector: {config.url}")
+    report.notes.append(f"events write to {config.db_path}")
+    report.notes.append("run 'tranquil' to open the terminal Fleet view")
     if agent in {"all", "claude-code", "claude"}:
         settings_path = claude_settings_path(scope, cwd=cwd)
         if undo:
@@ -119,15 +120,14 @@ def install_claude(settings_path: Path, config: TranquilConfig, report: InitRepo
     updated = json.loads(json.dumps(original))
     remove_tranquil_hooks(updated, config)
     hooks = updated.setdefault("hooks", {})
-    for event_name, (slug, needs_matcher) in CLAUDE_EVENTS.items():
+    for event_name, (_slug, needs_matcher) in CLAUDE_EVENTS.items():
         event_hooks = hooks.setdefault(event_name, [])
         entry: dict[str, Any] = {
             "hooks": [
                 {
-                    "type": "http",
-                    "url": f"{config.url}/hooks/{slug}",
-                    "timeout": 5,
-                    "headers": {"Authorization": f"Bearer {config.token}"},
+                    "type": "command",
+                    "command": forward_command(config, event_name, agent="claude-code"),
+                    "timeout": 10,
                 }
             ]
         }
@@ -137,7 +137,7 @@ def install_claude(settings_path: Path, config: TranquilConfig, report: InitRepo
     updated["_tranquil"] = {
         "managed": True,
         "version": "0.1.0",
-        "collector": config.url,
+        "home": str(config.home),
         "events": sorted(CLAUDE_EVENTS),
     }
     mcp_servers = updated.setdefault("mcpServers", {})
@@ -172,7 +172,7 @@ def undo_claude(settings_path: Path, config: TranquilConfig, report: InitReport)
 def install_codex(hooks_path: Path, config: TranquilConfig, report: InitReport) -> None:
     original = read_json_object(hooks_path)
     updated = json.loads(json.dumps(original))
-    remove_tranquil_command_hooks(updated, config)
+    remove_tranquil_hooks(updated, config)
     hooks = updated.setdefault("hooks", {})
     for event_name, needs_matcher in CODEX_EVENTS.items():
         event_hooks = hooks.setdefault(event_name, [])
@@ -180,8 +180,8 @@ def install_codex(hooks_path: Path, config: TranquilConfig, report: InitReport) 
             "hooks": [
                 {
                     "type": "command",
-                    "command": codex_forward_command(config, event_name),
-                    "timeout": 2,
+                    "command": forward_command(config, event_name, agent="codex"),
+                    "timeout": 5,
                     "statusMessage": "Sending event to Tranquil",
                 }
             ]
@@ -192,7 +192,7 @@ def install_codex(hooks_path: Path, config: TranquilConfig, report: InitReport) 
     updated["_tranquil"] = {
         "managed": True,
         "version": "0.1.0",
-        "collector": config.url,
+        "home": str(config.home),
         "events": sorted(CODEX_EVENTS),
     }
     if updated == original:
@@ -210,7 +210,7 @@ def undo_codex(hooks_path: Path, config: TranquilConfig, report: InitReport) -> 
         return
     original = read_json_object(hooks_path)
     updated = json.loads(json.dumps(original))
-    remove_tranquil_command_hooks(updated, config)
+    remove_tranquil_hooks(updated, config)
     updated.pop("_tranquil", None)
     if updated == original:
         report.unchanged.append(str(hooks_path))
@@ -219,15 +219,21 @@ def undo_codex(hooks_path: Path, config: TranquilConfig, report: InitReport) -> 
     report.removed.append(str(hooks_path))
 
 
-def codex_forward_command(config: TranquilConfig, event_name: str) -> str:
+def forward_command(config: TranquilConfig, event_name: str, agent: str) -> str:
+    """Command-hook invocation that writes the event straight to SQLite.
+
+    Uses ``python -m tranquil.hook_forwarder`` so the per-event process imports
+    only the lightweight capture path (no rich, no http server, no tui).
+    """
     return " ".join(
         [
             shlex.quote(sys.executable),
             "-m",
-            "tranquil",
+            "tranquil.hook_forwarder",
             "--home",
             shlex.quote(str(config.home)),
-            "hook-forward",
+            "--agent",
+            shlex.quote(agent),
             "--event",
             shlex.quote(event_name),
         ]
@@ -235,6 +241,11 @@ def codex_forward_command(config: TranquilConfig, event_name: str) -> str:
 
 
 def remove_tranquil_hooks(settings: dict[str, Any], config: TranquilConfig) -> None:
+    """Remove Tranquil-managed hook entries.
+
+    Matches both the new command hooks and any legacy HTTP collector hooks, so a
+    re-run of ``init`` (or ``--undo``) cleanly upgrades older installs.
+    """
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return
@@ -243,10 +254,7 @@ def remove_tranquil_hooks(settings: dict[str, Any], config: TranquilConfig) -> N
     for event_name, entries in hooks.items():
         if not isinstance(entries, list):
             continue
-        kept = []
-        for entry in entries:
-            if not entry_has_tranquil_hook(entry, prefixes):
-                kept.append(entry)
+        kept = [entry for entry in entries if not entry_is_tranquil(entry, prefixes)]
         hooks[event_name] = kept
         if not kept:
             empty_events.append(event_name)
@@ -267,28 +275,7 @@ def remove_tranquil_mcp(settings: dict[str, Any]) -> None:
         settings.pop("mcpServers", None)
 
 
-def remove_tranquil_command_hooks(settings: dict[str, Any], config: TranquilConfig) -> None:
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
-        return
-    empty_events: list[str] = []
-    for event_name, entries in hooks.items():
-        if not isinstance(entries, list):
-            continue
-        kept = []
-        for entry in entries:
-            if not entry_has_tranquil_command_hook(entry, config):
-                kept.append(entry)
-        hooks[event_name] = kept
-        if not kept:
-            empty_events.append(event_name)
-    for event_name in empty_events:
-        hooks.pop(event_name, None)
-    if not hooks:
-        settings.pop("hooks", None)
-
-
-def entry_has_tranquil_hook(entry: Any, prefixes: set[str]) -> bool:
+def entry_is_tranquil(entry: Any, prefixes: set[str]) -> bool:
     if not isinstance(entry, dict):
         return False
     hook_items = entry.get("hooks")
@@ -300,31 +287,10 @@ def entry_has_tranquil_hook(entry: Any, prefixes: set[str]) -> bool:
         url = str(hook.get("url", ""))
         if any(url.startswith(prefix) for prefix in prefixes):
             return True
-    return False
-
-
-def entry_has_tranquil_command_hook(entry: Any, config: TranquilConfig) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    hook_items = entry.get("hooks")
-    if not isinstance(hook_items, list):
-        return False
-    for hook in hook_items:
-        if not isinstance(hook, dict):
-            continue
         command = str(hook.get("command", ""))
-        if "tranquil" in command and "hook-forward" in command:
+        if "tranquil" in command and ("hook_forwarder" in command or "hook-forward" in command):
             return True
     return False
-
-
-def record_codex_paths(config: TranquilConfig, report: InitReport) -> None:
-    found = [path for path in config.codex_rollout_paths if Path(path).expanduser().exists()]
-    if found:
-        report.notes.append("codex rollout paths: " + ", ".join(found))
-    else:
-        report.notes.append("codex rollout paths recorded; no existing ~/.codex session directory found")
-    report.notes.append("codex hooks can POST to the same /hooks/* endpoints with agent='codex'")
 
 
 def read_json_object(path: Path) -> dict[str, Any]:

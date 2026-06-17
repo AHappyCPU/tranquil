@@ -3,20 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .app import run_terminal_app
 from .codex_audit import audit_codex_paths
 from .config import load_config, save_config
 from .evals import replay_fixture, run_eval, run_eval_matrix
-from .hook_forwarder import main as hook_forward_main
 from .init import claude_settings_path, codex_hooks_path, run_init
 from .mcp import run_mcp_server
-from .normalize import normalize_event
 from .otel import export_otlp_http
-from .server import run_terminal_app, serve
 from .signals import scan_idle_runs
 from .storage import Storage
 from .suites import import_fixture_file, import_suite_fixtures
@@ -44,13 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--home", type=Path, default=None, help="Tranquil home directory (default: ~/.tranquil or TRANQUIL_HOME).")
     sub = parser.add_subparsers(dest="command_name")
 
-    app_parser = sub.add_parser("app", help="Start the collector and terminal Fleet view.")
+    app_parser = sub.add_parser("app", help="Start the terminal Fleet view.")
     app_parser.add_argument("--interval", type=float, default=2.0)
-
-    serve_parser = sub.add_parser("serve", help="Start the collector and web dashboard without the terminal UI.")
-    serve_parser.add_argument("--host", default=None)
-    serve_parser.add_argument("--port", type=int, default=None)
-    serve_parser.add_argument("--db", type=Path, default=None)
 
     init_parser = sub.add_parser("init", help="Install or remove local agent hooks.")
     init_parser.add_argument("--agent", choices=["all", "claude-code", "codex"], default="all")
@@ -59,9 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--launch", action="store_true", help="Launch the dashboard after wiring hooks.")
     init_parser.add_argument("--no-launch", action="store_true", help="Only wire hooks; do not launch the dashboard.")
 
-    doctor_parser = sub.add_parser("doctor", help="Verify config, SQLite, and optional collector flow.")
-    doctor_parser.add_argument("--live", action="store_true", help="Require a live collector synthetic event check.")
-    doctor_parser.add_argument("--no-live", action="store_true", help="Skip the synthetic event check even if the collector is running.")
+    doctor_parser = sub.add_parser("doctor", help="Verify config, SQLite, and hook wiring.")
     doctor_parser.add_argument("--codex-audit", action="store_true", help="Inspect configured Codex rollout paths for local coverage.")
 
     status_parser = sub.add_parser("status", help="Print fleet status.")
@@ -151,11 +140,6 @@ def build_parser() -> argparse.ArgumentParser:
     purge_group.add_argument("--older-than", type=int, metavar="DAYS")
     purge_group.add_argument("--all", action="store_true")
 
-    hook_forward_parser = sub.add_parser("hook-forward", help="Forward command-hook stdin to the local collector.")
-    hook_forward_parser.add_argument("--event", required=True)
-    hook_forward_parser.add_argument("--timeout", type=float, default=1.0)
-    hook_forward_parser.add_argument("--url", default=None)
-
     return parser
 
 
@@ -163,17 +147,6 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command_name == "app":
         config = load_config(home=args.home, create=True)
         return run_terminal_app(config, interval=args.interval)
-    if args.command_name == "serve":
-        config = load_config(home=args.home, create=True)
-        if args.host:
-            config.host = args.host
-        if args.port:
-            config.port = args.port
-        if args.db:
-            config.db_path = args.db.expanduser()
-        save_config(config)
-        serve(config)
-        return 0
     if args.command_name == "init":
         report = run_init(agent=args.agent, scope=args.scope, undo=args.undo, home=args.home)
         for line in report.lines():
@@ -209,13 +182,6 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_sync(args)
     if args.command_name == "purge":
         return cmd_purge(args)
-    if args.command_name == "hook-forward":
-        forwarded = ["--event", args.event, "--timeout", str(args.timeout)]
-        if args.home:
-            forwarded.extend(["--home", str(args.home)])
-        if args.url:
-            forwarded.extend(["--url", args.url])
-        return hook_forward_main(forwarded)
     raise ValueError(f"unknown command: {args.command_name}")
 
 
@@ -237,28 +203,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"home: {config.home}")
     print(f"config: {config.config_path}")
     print(f"db: {config.db_path}")
-    print(f"collector: {config.url}")
     for line in doctor_hook_lines(config, Path.cwd()):
         print(line)
     with_storage = Storage(config.db_path, thresholds=config.signal_thresholds, raw_payloads=config.raw_payloads)
     try:
-        print("sqlite: ok")
-        health = get_json(f"{config.url}/api/health", timeout=1.0)
-        print(f"collector health: ok queue={health.get('queue_depth')} worker={health.get('worker_alive')}")
-        if not args.no_live:
-            payload = {
-                "event_hint": "user-prompt-submit",
-                "agent": "claude-code",
-                "session_id": "doctor",
-                "prompt": "tranquil doctor synthetic event",
-                "cwd": str(Path.cwd()),
-            }
-            posted = post_json(f"{config.url}/api/events", payload, timeout=2.0)
-            print(f"synthetic event: ok run={posted.get('run_id')}")
-    except urllib.error.URLError:
-        print("collector health: not running")
-        if args.live:
-            return 1
+        stats = with_storage.stats()
+        print(f"sqlite: ok runs={stats['runs']} signaled={stats['signaled']}")
     finally:
         with_storage.close()
     if args.codex_audit:
@@ -570,22 +520,6 @@ def cmd_purge(args: argparse.Namespace) -> int:
         storage.close()
 
 
-def get_json(url: str, timeout: float) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
 def short(value: Any, length: int = 72) -> str:
     text = str(value or "").replace("\n", " ")
     return text if len(text) <= length else text[: length - 1] + "..."
@@ -612,13 +546,13 @@ def format_counts(values: dict[str, int], limit: int = 6) -> str:
 
 def doctor_hook_lines(config: Any, cwd: Path) -> list[str]:
     checks = [
-        ("claude user hooks", claude_settings_path("user"), "http"),
-        ("claude project hooks", claude_settings_path("project", cwd=cwd), "http"),
-        ("codex user hooks", codex_hooks_path("user"), "command"),
-        ("codex project hooks", codex_hooks_path("project", cwd=cwd), "command"),
+        ("claude user hooks", claude_settings_path("user")),
+        ("claude project hooks", claude_settings_path("project", cwd=cwd)),
+        ("codex user hooks", codex_hooks_path("user")),
+        ("codex project hooks", codex_hooks_path("project", cwd=cwd)),
     ]
     lines = []
-    for label, path, kind in checks:
+    for label, path in checks:
         if not path.exists():
             lines.append(f"{label}: missing ({path})")
             continue
@@ -627,38 +561,43 @@ def doctor_hook_lines(config: Any, cwd: Path) -> list[str]:
         except json.JSONDecodeError:
             lines.append(f"{label}: invalid JSON ({path})")
             continue
-        wired = has_tranquil_http_hook(payload, config.url) if kind == "http" else has_tranquil_command_hook(payload, str(config.home))
-        lines.append(f"{label}: {'ok' if wired else 'missing Tranquil hook'} ({path})")
+        if has_tranquil_command_hook(payload):
+            lines.append(f"{label}: ok ({path})")
+        elif has_stale_http_hook(payload):
+            lines.append(f"{label}: stale HTTP hooks; run 'tranquil init' to upgrade ({path})")
+        else:
+            lines.append(f"{label}: missing Tranquil hook ({path})")
     return lines
 
 
-def has_tranquil_http_hook(payload: dict[str, Any], url: str) -> bool:
+def has_tranquil_command_hook(payload: dict[str, Any]) -> bool:
+    for hook in iter_hooks(payload):
+        command = str(hook.get("command", ""))
+        if "tranquil" in command and ("hook_forwarder" in command or "hook-forward" in command):
+            return True
+    return False
+
+
+def has_stale_http_hook(payload: dict[str, Any]) -> bool:
+    for hook in iter_hooks(payload):
+        if "/hooks/" in str(hook.get("url", "")):
+            return True
+    return False
+
+
+def iter_hooks(payload: dict[str, Any]) -> list[dict[str, Any]]:
     hooks = payload.get("hooks")
+    found: list[dict[str, Any]] = []
     if not isinstance(hooks, dict):
-        return False
+        return found
     for entries in hooks.values():
         if not isinstance(entries, list):
             continue
         for entry in entries:
             for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
-                if isinstance(hook, dict) and str(hook.get("url", "")).startswith(f"{url}/hooks/"):
-                    return True
-    return False
-
-
-def has_tranquil_command_hook(payload: dict[str, Any], home: str) -> bool:
-    hooks = payload.get("hooks")
-    if not isinstance(hooks, dict):
-        return False
-    for entries in hooks.values():
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
-                command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
-                if "tranquil" in command and "hook-forward" in command and home in command:
-                    return True
-    return False
+                if isinstance(hook, dict):
+                    found.append(hook)
+    return found
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tranquil"
 version = "0.1.0"
-description = "Local-first eval and observability for coding agents."
+description = "Local-first, terminal-native eval and observability for coding agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -16,7 +16,6 @@ keywords = ["agents", "observability", "evals", "claude", "codex"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
-  "Environment :: Web Environment",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
