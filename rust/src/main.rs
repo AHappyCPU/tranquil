@@ -129,29 +129,17 @@ fn cmd_tui(args: &[String], home: Option<PathBuf>) -> Result<i32, String> {
         .transpose()
         .map_err(|err| format!("invalid --interval: {err}"))?
         .unwrap_or(config.tail_interval_seconds);
-    let mut tail_state = tailer::TailState::default();
-    loop {
-        let ingested = match tailer::scan_configured_once(&storage, &config, &mut tail_state) {
-            Ok(count) => count,
-            Err(err) => {
-                eprintln!("tranquil-tail: {err}");
-                0
-            }
-        };
-        let output = if let Some(run_id) = &run_id {
-            tui::render_run(&storage, run_id, limit.max(1) as usize)?
-        } else {
-            tui::render_fleet(&storage, &filters, ingested)?
-        };
-        if !once {
-            print!("\x1b[2J\x1b[H");
-        }
-        println!("{output}");
-        if once {
-            break;
-        }
-        thread::sleep(Duration::from_secs_f64(interval.max(0.5)));
-    }
+    tui::run_tui(
+        &storage,
+        &config,
+        tui::TuiOptions {
+            once,
+            run_id,
+            filters,
+            events_limit: limit.max(1) as usize,
+            interval,
+        },
+    )?;
     Ok(0)
 }
 

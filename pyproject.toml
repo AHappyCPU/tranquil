@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.scripts]
-tranquil = "tranquil.cli:main"
+tranquil-python = "tranquil.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tranquil"]

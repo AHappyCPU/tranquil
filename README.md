@@ -11,22 +11,24 @@ signals, stop requests, policy denial, transcript and Codex rollout backfill,
 tail/app rendering, notifications, fixtures, suite import, deterministic evals
 with baselines, matrix replay, outcome judging, trace sampling, git-worktree
 replay, doctor audits, JSON/OTLP export, opt-in sync, MCP query tools,
-run filtering, run diffs, retention purge, and hook init/undo. The previous
-Python implementation remains in `src/tranquil` while narrower parity gaps such
-as the richer interactive keyboard TUI are retired or ported.
+run filtering, run diffs, retention purge, and hook init/undo. Cargo owns the
+`tranquil` executable; the Python package is retained as `tranquil-python` only
+for legacy comparison while the remaining Python runtime is retired.
 
-There is no server, no port, and no web dashboard. `pip install .` gives you a
-working `tranquil` command. Hooks write straight to SQLite, so nothing has to be
-running for capture to work, and a down collector can never block or error your
-agent.
+There is no server, no port, and no web dashboard. Hooks write straight to
+SQLite, so nothing has to be running for capture to work, and a down collector
+can never block or error your agent.
 
 ## Quick start
 
 ```bash
-cargo build --release
-target/release/tranquil init --agent all --scope user
-target/release/tranquil status --table
+cargo install --path .
+tranquil init --agent all --scope user
+tranquil status --table
 ```
+
+For local development without installing, run `cargo run -- status --table` or
+`cargo run -- tui --once`.
 
 `tranquil init` creates local config and wires command hooks. The setup step is
 idempotent, so running it again keeps existing Tranquil-managed hooks current
@@ -79,17 +81,15 @@ only when you run the command.
 ## Commands
 
 ```text
-tranquil                       Wire hooks if needed and open the terminal Fleet view
-tranquil app                   Same as above
-tranquil app --no-init         Open the terminal Fleet view without touching hooks
-tranquil init                  Wire local command hooks and launch the app
-tranquil init --no-launch      Wire hooks without starting the app
+tranquil                       Print fleet status
+tranquil app                   Open the terminal Fleet view
+tranquil tui                   Open the terminal Fleet view
+tranquil init                  Wire local command hooks
 tranquil init --undo           Remove Tranquil-managed hook entries
 tranquil doctor                Check config, SQLite, and hook wiring
 tranquil doctor --codex-audit  Inspect configured Codex rollout paths and report
                                local coverage fields
 tranquil status                Print fleet status
-tranquil status --line         Print compact status-line output
 tranquil status --agent codex --repo api --branch main --label task=auth --table
                                Filter the terminal fleet table
 tranquil signals               List active signals
@@ -124,8 +124,8 @@ tranquil export --otel http://localhost:4318/v1/logs
 tranquil sync --endpoint https://example.internal/tranquil
                                Push a local export to an opt-in sync endpoint
 tranquil purge --older-than 30 Delete older local runs and related data
-tranquil tui                   Rich terminal Fleet view with live refresh,
-                               keyboard navigation, peek, and stop request
+tranquil tui                   Terminal Fleet view with live refresh, keyboard
+                               navigation, peek, and stop request
 tranquil tui --run <run_id>    Terminal Run view with signals, files, scores,
                                subagents, and recent events
 ```
@@ -174,6 +174,18 @@ Implemented now:
 - Local JSON export, OTLP/HTTP log export, opt-in sync push, and purge controls.
 
 Both Claude Code and Codex run command hooks. `tranquil init` writes hook
-entries that run `python -m tranquil.hook_forwarder`, which posts nothing over
-the network — it writes directly to the local SQLite store. Codex may require
+entries that run `tranquil hook-forwarder`, which posts nothing over the
+network; it writes directly to the local SQLite store. Codex may require
 reviewing the new hooks with `/hooks` before it runs them.
+
+## Distribution
+
+The supported install path is Rust-first:
+
+```bash
+cargo install --path .
+```
+
+The crate exposes a single `tranquil` binary. Python packaging is kept only for
+legacy comparison and installs `tranquil-python`, not `tranquil`, so
+`pip install .` no longer shadows the Rust executable.
