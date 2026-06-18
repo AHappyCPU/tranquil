@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import io
-import select
+import os
 import sys
-import termios
 import time
-import tty
 from typing import Any
 
 from rich import box
@@ -21,6 +19,13 @@ from rich.text import Text
 from .config import SignalThresholds
 from .signals import scan_idle_runs
 from .storage import Storage
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
 
 
 DEFAULT_WIDTH = 128
@@ -518,6 +523,9 @@ def selected_run_id(
 
 @contextlib.contextmanager
 def raw_terminal(stdin: Any) -> Any:
+    if os.name == "nt":
+        yield
+        return
     fd = stdin.fileno()
     original = termios.tcgetattr(fd)
     try:
@@ -528,6 +536,20 @@ def raw_terminal(stdin: Any) -> Any:
 
 
 def read_key(stdin: Any, timeout: float) -> str:
+    if os.name == "nt":
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not msvcrt.kbhit():
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            first = msvcrt.getwch()
+            if first in {"\r", "\n"}:
+                return "enter"
+            if first in {"\x00", "\xe0"}:
+                second = msvcrt.getwch()
+                return {"H": "up", "P": "down", "M": "right", "K": "left"}.get(second, "")
+            return first
+        return ""
     ready, _, _ = select.select([stdin], [], [], timeout)
     if not ready:
         return ""

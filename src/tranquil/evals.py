@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import json
-import shlex
 import shutil
 import subprocess
 from fnmatch import fnmatch
@@ -10,7 +9,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .storage import Storage, extract_paths, extract_tool_command
-from .util import command_looks_like_build, command_looks_like_check, command_looks_like_test, json_dumps, parse_iso, safe_int
+from .util import (
+    command_looks_like_build,
+    command_looks_like_check,
+    command_looks_like_test,
+    json_dumps,
+    parse_iso,
+    run_user_command,
+    safe_int,
+    shell_join,
+)
 
 
 SUPPORTED_SCORERS = {
@@ -310,9 +318,8 @@ def score_outcome_judge(
         "events": events,
     }
     try:
-        completed = subprocess.run(
+        completed = run_user_command(
             judge_command,
-            shell=True,
             input=json_dumps(payload),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -510,9 +517,8 @@ def replay_fixture(
         env["TRANQUIL_REPLAY_MODEL"] = model
     if config_path:
         env["TRANQUIL_REPLAY_CONFIG"] = config_path
-    completed = subprocess.run(
+    completed = run_user_command(
         command,
-        shell=True,
         cwd=repo_dir,
         env=env,
         stdout=subprocess.PIPE,
@@ -677,7 +683,7 @@ def replay_command_for_agent(agent: str, prompt: str, model: str | None = None) 
         if model:
             parts.extend(["--model", model])
         parts.append(prompt)
-        return " ".join(shlex.quote(part) for part in parts)
+        return shell_join(parts)
     return None
 
 

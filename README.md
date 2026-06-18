@@ -2,32 +2,40 @@
 
 Tranquil is a local-first, terminal-native observability and eval layer for
 coding agents. It captures agent activity through command hooks that write
-directly to a local SQLite database, renders a live Rich terminal Fleet view,
-detects unhealthy runs, and can promote captured runs into eval fixtures.
+directly to a local SQLite database, renders local fleet status, detects
+unhealthy runs, and can promote captured runs into eval fixtures.
+
+The rewrite is moving Tranquil to Rust. The Rust binary is now the primary path
+for config creation, command-hook ingestion, SQLite persistence, status,
+signals, stop requests, policy denial, transcript and Codex rollout backfill,
+tail/app rendering, notifications, fixtures, suite import, deterministic evals
+with baselines, matrix replay, outcome judging, trace sampling, git-worktree
+replay, doctor audits, JSON/OTLP export, opt-in sync, MCP query tools,
+run filtering, run diffs, retention purge, and hook init/undo. The previous
+Python implementation remains in `src/tranquil` while narrower parity gaps such
+as the richer interactive keyboard TUI are retired or ported.
 
 There is no server, no port, and no web dashboard. `pip install .` gives you a
 working `tranquil` command. Hooks write straight to SQLite, so nothing has to be
-running for capture to work, and a down collector can never block — or error —
-your agent.
+running for capture to work, and a down collector can never block or error your
+agent.
 
 ## Quick start
 
 ```bash
-python -m pip install -e .
-tranquil
+cargo build --release
+target/release/tranquil init --agent all --scope user
+target/release/tranquil status --table
 ```
 
-In an interactive terminal, `tranquil` creates local config, wires hooks, and
-launches the terminal app. The setup step is idempotent, so running `tranquil`
-again keeps existing Tranquil-managed hooks current without duplicating them.
-Use `tranquil app --no-init` when you only want to open the collector-free
-terminal Fleet view without touching hook config. Use `tranquil init --no-launch`
-when you only want to update config and hook wiring without launching the app.
+`tranquil init` creates local config and wires command hooks. The setup step is
+idempotent, so running it again keeps existing Tranquil-managed hooks current
+without duplicating them.
 
 `tranquil init` installs **command hooks** for both Claude Code and Codex. Each
-hook runs a lightweight `python -m tranquil.hook_forwarder` that reads the hook
-JSON on stdin and writes a normalized event straight to
-`~/.tranquil/tranquil.db`. The ingester is strictly fail-open: any error is
+hook runs the Rust `tranquil hook-forwarder` command, reads the hook JSON on
+stdin, and writes a normalized event straight to `~/.tranquil/tranquil.db`. The
+ingester is strictly fail-open: any error is
 logged to stderr and it still exits 0, so the agent loop is never blocked.
 
 While the terminal app is open it also runs the transcript and Codex rollout

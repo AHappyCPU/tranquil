@@ -4,7 +4,9 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import os
 import re
+import shlex
 import subprocess
 import uuid
 from pathlib import Path
@@ -286,3 +288,101 @@ def command_looks_like_check(command: str) -> bool:
 def command_looks_like_pr_or_commit(command: str) -> bool:
     lowered = command.lower()
     return any(term in lowered for term in ["gh pr create", "git commit", "git push", "hub pull-request"])
+
+
+def shell_join(parts: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(parts)
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def run_user_command(
+    command: str,
+    *,
+    input: str | None = None,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+    stdout: Any = None,
+    stderr: Any = None,
+    text: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a user-configured command with sane Windows quoting.
+
+    Existing configs and tests use POSIX-style quoting via ``shlex.quote``.
+    Native Windows ``shell=True`` delegates to ``cmd.exe``, which does not
+    understand that quoting. On Windows, parse simple command lines into argv
+    and handle the small POSIX replay helpers that Tranquil documents.
+    """
+    if os.name != "nt":
+        return subprocess.run(
+            command,
+            shell=True,
+            input=input,
+            cwd=cwd,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+            timeout=timeout,
+        )
+    invocation = windows_command_invocation(command)
+    try:
+        return subprocess.run(
+            invocation,
+            shell=False,
+            input=input,
+            cwd=cwd,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return subprocess.run(
+            powershell_invocation(command),
+            shell=False,
+            input=input,
+            cwd=cwd,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+            timeout=timeout,
+        )
+
+
+def windows_command_invocation(command: str) -> list[str]:
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return powershell_invocation(command)
+    if not argv:
+        return powershell_invocation(command)
+    if argv[0] == "test" and len(argv) == 3 and argv[1] == "-f":
+        target = powershell_path_expression(argv[2])
+        return powershell_invocation(f"if (Test-Path -LiteralPath {target} -PathType Leaf) {{ exit 0 }} else {{ exit 1 }}")
+    if argv[0] == "grep" and len(argv) >= 3 and not argv[1].startswith("-"):
+        pattern = powershell_quote(argv[1])
+        path = powershell_quote(argv[2])
+        return powershell_invocation(
+            f"if (Select-String -Quiet -SimpleMatch -Pattern {pattern} -Path {path}) {{ exit 0 }} else {{ exit 1 }}"
+        )
+    if any(token in {"&&", "||", "|", ";", ">", ">>", "<"} for token in argv):
+        return powershell_invocation(command)
+    return argv
+
+
+def powershell_invocation(command: str) -> list[str]:
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]
+
+
+def powershell_path_expression(value: str) -> str:
+    if re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", value):
+        return f"$env:{value[1:]}"
+    return powershell_quote(value)
+
+
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"

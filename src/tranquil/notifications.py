@@ -6,7 +6,7 @@ import urllib.request
 from typing import Any
 
 from .config import TranquilConfig
-from .util import json_dumps
+from .util import json_dumps, run_user_command
 
 
 class SignalNotifier:
@@ -59,9 +59,8 @@ class SignalNotifier:
 
     def _run_command(self, command: str, body: str) -> None:
         try:
-            subprocess.run(
+            run_user_command(
                 command,
-                shell=True,
                 input=body,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

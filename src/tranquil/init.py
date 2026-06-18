@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .config import TranquilConfig, default_home, load_config, save_config
+from .util import shell_join
 
 
 CLAUDE_EVENTS = {
@@ -225,17 +225,17 @@ def forward_command(config: TranquilConfig, event_name: str, agent: str) -> str:
     Uses ``python -m tranquil.hook_forwarder`` so the per-event process imports
     only the lightweight capture path (no rich, no http server, no tui).
     """
-    return " ".join(
+    return shell_join(
         [
-            shlex.quote(sys.executable),
+            sys.executable,
             "-m",
             "tranquil.hook_forwarder",
             "--home",
-            shlex.quote(str(config.home)),
+            str(config.home),
             "--agent",
-            shlex.quote(agent),
+            agent,
             "--event",
-            shlex.quote(event_name),
+            event_name,
         ]
     )
 
