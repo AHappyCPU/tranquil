@@ -14,12 +14,15 @@ your agent.
 
 ```bash
 python -m pip install -e .
-tranquil init
+tranquil
 ```
 
-In an interactive terminal, `tranquil init` wires hooks and launches the local
-terminal app. Use `tranquil init --no-launch` when you only want to update
-config, or run `tranquil` later to open the collector-free terminal Fleet view.
+In an interactive terminal, `tranquil` creates local config, wires hooks, and
+launches the terminal app. The setup step is idempotent, so running `tranquil`
+again keeps existing Tranquil-managed hooks current without duplicating them.
+Use `tranquil app --no-init` when you only want to open the collector-free
+terminal Fleet view without touching hook config. Use `tranquil init --no-launch`
+when you only want to update config and hook wiring without launching the app.
 
 `tranquil init` installs **command hooks** for both Claude Code and Codex. Each
 hook runs a lightweight `python -m tranquil.hook_forwarder` that reads the hook
@@ -68,8 +71,9 @@ only when you run the command.
 ## Commands
 
 ```text
-tranquil                       Open the terminal Fleet view (default command)
+tranquil                       Wire hooks if needed and open the terminal Fleet view
 tranquil app                   Same as above
+tranquil app --no-init         Open the terminal Fleet view without touching hooks
 tranquil init                  Wire local command hooks and launch the app
 tranquil init --no-launch      Wire hooks without starting the app
 tranquil init --undo           Remove Tranquil-managed hook entries

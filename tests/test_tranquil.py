@@ -1236,6 +1236,26 @@ class InitTests(unittest.TestCase):
             args.command_name = "app"
         self.assertEqual(args.command_name, "app")
 
+    def test_default_app_auto_initializes_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            with mock.patch("tranquil.cli.run_init") as initialized:
+                with mock.patch("tranquil.cli.run_terminal_app", return_value=0) as launched:
+                    code = tranquil_main(["--home", str(home)])
+            self.assertEqual(code, 0)
+            initialized.assert_called_once_with(agent="all", scope="user", undo=False, home=home)
+            self.assertEqual(launched.call_count, 1)
+
+    def test_app_no_init_skips_auto_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            with mock.patch("tranquil.cli.run_init") as initialized:
+                with mock.patch("tranquil.cli.run_terminal_app", return_value=0) as launched:
+                    code = tranquil_main(["--home", str(home), "app", "--no-init"])
+            self.assertEqual(code, 0)
+            initialized.assert_not_called()
+            self.assertEqual(launched.call_count, 1)
+
     def test_init_launch_uses_terminal_app(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

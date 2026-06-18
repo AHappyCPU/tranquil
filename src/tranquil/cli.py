@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     app_parser = sub.add_parser("app", help="Start the terminal Fleet view.")
     app_parser.add_argument("--interval", type=float, default=2.0)
+    app_parser.add_argument("--no-init", action="store_true", help="Open without auto-installing local hooks.")
 
     init_parser = sub.add_parser("init", help="Install or remove local agent hooks.")
     init_parser.add_argument("--agent", choices=["all", "claude-code", "codex"], default="all")
@@ -145,8 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def dispatch(args: argparse.Namespace) -> int:
     if args.command_name == "app":
-        config = load_config(home=args.home, create=True)
-        return run_terminal_app(config, interval=args.interval)
+        return cmd_app(args)
     if args.command_name == "init":
         report = run_init(agent=args.agent, scope=args.scope, undo=args.undo, home=args.home)
         for line in report.lines():
@@ -183,6 +183,21 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command_name == "purge":
         return cmd_purge(args)
     raise ValueError(f"unknown command: {args.command_name}")
+
+
+def cmd_app(args: argparse.Namespace) -> int:
+    if not getattr(args, "no_init", False):
+        auto_init(args)
+    config = load_config(home=args.home, create=True)
+    return run_terminal_app(config, interval=getattr(args, "interval", 2.0))
+
+
+def auto_init(args: argparse.Namespace) -> None:
+    """Best-effort one-command setup before opening the terminal app."""
+    try:
+        run_init(agent="all", scope="user", undo=False, home=args.home)
+    except Exception as exc:
+        print(f"tranquil: auto-init skipped: {exc}", file=sys.stderr)
 
 
 def should_launch_after_init(args: argparse.Namespace) -> bool:
